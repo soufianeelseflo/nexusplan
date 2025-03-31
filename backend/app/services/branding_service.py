@@ -1,142 +1,225 @@
 # backend/app/services/branding_service.py
 from app.core.config import settings
 from app.services.openrouter_service import generate_with_openrouter
-from app.services.cache_service import async_memory_cache
-# Import library for X.com API interaction (e.g., tweepy - add to requirements.txt)
+from app.services.cache_service import async_ttl_cache
+# Import library for X.com API interaction (e.g., tweepy)
+# Ensure 'tweepy' is in requirements.txt if uncommenting API calls
 # import tweepy
 import asyncio
 import logging
 import random
+import json
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
-# --- X.com API Client Setup (Placeholder) ---
-# Requires getting API keys for X.com (may need developer account approval)
-# and configuring the client library (e.g., tweepy v2 using OAuth 2.0 Bearer Token or OAuth 1.0a)
-# Store X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET in environment variables
-# x_api = None
+# --- X.com API Client Setup (Requires User Credentials in .env) ---
+# This section attempts initialization but gracefully handles failure.
+x_client_v2 = None
+X_API_ENABLED = False
+# Uncomment these lines in .env.example and provide keys if using X.com API
+# X_API_KEY="YOUR_X_CONSUMER_KEY"
+# X_API_SECRET="YOUR_X_CONSUMER_SECRET"
+# X_ACCESS_TOKEN="YOUR_X_ACCESS_TOKEN"
+# X_ACCESS_SECRET="YOUR_X_ACCESS_SECRET_TOKEN"
+
 # try:
-#     auth = tweepy.OAuth1UserHandler(
-#         settings.X_API_KEY, settings.X_API_SECRET,
-#         settings.X_ACCESS_TOKEN, settings.X_ACCESS_SECRET
-#     )
-#     x_api = tweepy.API(auth, wait_on_rate_limit=True)
-#     x_client_v2 = tweepy.Client(
-#         consumer_key=settings.X_API_KEY, consumer_secret=settings.X_API_SECRET,
-#         access_token=settings.X_ACCESS_TOKEN, access_token_secret=settings.X_ACCESS_SECRET
-#     )
-#     logger.info("X.com API client initialized.")
+#     if all([settings.X_API_KEY, settings.X_API_SECRET, settings.X_ACCESS_TOKEN, settings.X_ACCESS_SECRET]):
+#         x_client_v2 = tweepy.Client(
+#             consumer_key=settings.X_API_KEY, consumer_secret=settings.X_API_SECRET,
+#             access_token=settings.X_ACCESS_TOKEN, access_token_secret=settings.X_ACCESS_SECRET,
+#             wait_on_rate_limit=True # Automatically handle rate limits if possible
+#         )
+#         # Verify credentials work
+#         me = x_client_v2.get_me()
+#         if me.data:
+#             logger.info(f"X.com API client initialized successfully for user @{me.data.username}.")
+#             X_API_ENABLED = True
+#         else:
+#             logger.error("X.com API client initialized but failed to verify credentials.")
+#             x_client_v2 = None
+#     else:
+#         logger.warning("X.com API credentials not fully configured in environment variables. X.com posting will be disabled.")
+# except ImportError:
+#     logger.warning("Tweepy library not installed (`pip install tweepy`). X.com posting disabled.")
 # except Exception as e:
-#     logger.error(f"Failed to initialize X.com API client: {e}. Branding bot posts will be disabled.")
+#     logger.error(f"Failed to initialize X.com API client: {e}. Branding bot posts will be disabled.", exc_info=True)
 
-
-@async_memory_cache(ttl=settings.CACHE_TTL_SECONDS // 2) # Cache for 30 mins
+# --- Content Generation ---
+@async_ttl_cache(ttl=settings.CACHE_TTL_SECONDS // 4) # Cache ideas for 15 mins
 async def generate_branding_content_idea() -> Optional[Dict[str, Any]]:
-    """Generates an idea for a branding post using AI."""
+    """
+    Generates a compelling content idea for X.com using AI (via OpenRouter).
+    Applies "Think Tool": Specific prompt, JSON validation, error handling.
+    """
     logger.info("Generating branding content idea...")
-    # Focus on topics relevant to B2B intelligence, AI, market trends, decision making
     prompt = f"""
-    Act as a B2B Content Strategist for an AI-powered intelligence firm ({settings.PROJECT_NAME}).
-    Generate ONE compelling content idea for an X.com post targeting executives in {', '.join(settings.TARGET_INDUSTRIES)} within {', '.join(settings.TARGET_COUNTRIES)}.
-    The idea should be relevant to current business trends (Q1 2025), AI's role in strategy, or rapid decision-making.
-    Suggest a format (e.g., short insight, question, mini-thread starter, link to a relevant (hypothetical) blog post).
-    Include 2-3 relevant, high-volume hashtags.
+    Act as a sharp B2B Content Strategist for {settings.PROJECT_NAME}, an AI-powered rapid intelligence firm.
+    Generate ONE unique, engaging content idea for an X.com post targeting executives and strategists in {', '.join(settings.TARGET_INDUSTRIES)} (focus on Tech & Finance) within {', '.join(settings.TARGET_COUNTRIES)}.
+    The idea must be highly relevant to current business challenges (Q1/Q2 2025), the strategic use of AI/data, or the importance of speed in decision-making. Avoid generic platitudes.
+    Suggest an effective format: "Short Insight", "Provocative Question", "Mini-Thread Starter (1/3)", "Data Point + Interpretation".
+    Include 3 relevant, specific, and moderately high-volume hashtags (mix broad and niche).
 
-    Format the output STRICTLY as a JSON object with keys: "idea_summary", "format", "hashtags" (list of strings).
-    Example: {{"idea_summary": "The biggest risk in Q2 isn't the economy, it's decision latency. AI can fix that.", "format": "Short Insight", "hashtags": ["#AIStrategy", "#DecisionMaking", "#BizIntel"]}}
+    Format the output STRICTLY as a valid JSON object with keys: "idea_summary" (string, max 150 chars), "format" (string), "hashtags" (list of 3 strings).
+    Example: {{"idea_summary": "Competitor analysis is useless if it's 2 weeks old. Real-time AI intel is the new table stakes.", "format": "Short Insight", "hashtags": ["#CompetitiveIntelligence", "#AI", "#DecisionSpeed"]}}
+    Output ONLY the JSON object.
     """
     try:
         idea_str = await generate_with_openrouter(
             prompt=prompt,
-            model_preference="balanced",
-            max_tokens=150
+            model_preference="balanced", # Good for creative but structured output
+            max_tokens=200,
+            temperature=0.7
         )
-        idea_data = json.loads(idea_str)
-        if isinstance(idea_data, dict) and "idea_summary" in idea_data and "format" in idea_data and "hashtags" in idea_data:
-            logger.info(f"Generated branding idea: {idea_data['idea_summary']}")
-            return idea_data
-        else:
-            logger.warning(f"AI branding idea generation returned invalid format: {idea_str}")
+        # --- Input/Output Validation ---
+        try:
+            # Find JSON within potential AI commentary
+            json_start = idea_str.find('{')
+            json_end = idea_str.rfind('}') + 1
+            if json_start != -1 and json_end != -1:
+                json_str = idea_str[json_start:json_end]
+                idea_data = json.loads(json_str)
+            else:
+                raise json.JSONDecodeError("No valid JSON object found", idea_str, 0)
+
+            if isinstance(idea_data, dict) and \
+               all(k in idea_data for k in ["idea_summary", "format", "hashtags"]) and \
+               isinstance(idea_data["idea_summary"], str) and \
+               isinstance(idea_data["format"], str) and \
+               isinstance(idea_data["hashtags"], list) and \
+               len(idea_data["hashtags"]) == 3 and \
+               all(isinstance(h, str) for h in idea_data["hashtags"]):
+                logger.info(f"Generated valid branding idea: {idea_data['idea_summary']}")
+                return idea_data
+            else:
+                logger.warning(f"AI branding idea generation returned invalid JSON structure: {idea_str}")
+                return None
+        except json.JSONDecodeError as json_err:
+            logger.error(f"Failed to decode JSON response for branding idea: {idea_str}. Error: {json_err}", exc_info=False)
             return None
+
+    except ConnectionError as conn_err:
+        logger.error(f"Connection error generating branding idea: {conn_err}", exc_info=False)
+        return None
     except Exception as e:
-        logger.error(f"Error generating branding content idea: {e}", exc_info=True)
+        logger.error(f"Unexpected error generating branding content idea: {e}", exc_info=True)
         return None
 
 
 async def craft_branding_post(idea_data: Dict[str, Any]) -> Optional[str]:
-    """Crafts the actual X.com post text based on the idea."""
-    logger.info(f"Crafting post for idea: {idea_data['idea_summary']}")
+    """
+    Crafts the actual X.com post text based on the generated idea using AI.
+    Applies "Think Tool": Specific prompt, length check, error handling.
+    """
+    logger.info(f"Crafting X.com post for idea: {idea_data['idea_summary']}")
+    website_url = "YOUR_DEPLOYED_WEBSITE_URL" # Replace with actual URL
+
     prompt = f"""
     Based on the following content idea:
     Summary: {idea_data['idea_summary']}
     Format: {idea_data['format']}
+    Hashtags: {', '.join(idea_data['hashtags'])}
 
-    Write the actual text for an engaging X.com post (max 270 characters).
-    Incorporate the suggested hashtags: {', '.join(idea_data['hashtags'])}
-    If the format is 'Thread Starter', write only the first tweet of the thread, ending with a hook like '(1/n)'.
-    Maintain a professional and insightful tone. Include a subtle call-to-action or link to our website [YOUR_WEBSITE_URL] if appropriate for the format, but prioritize engagement.
+    Write the final, engaging X.com post text (strict maximum 275 characters).
+    - If format is 'Thread Starter', end with "(1/3) 🧵👇".
+    - If format is 'Short Insight' or 'Data Point', be concise and impactful.
+    - If format is 'Provocative Question', pose the question clearly.
+    - Incorporate the hashtags naturally at the end.
+    - Maintain a highly professional, authoritative, and forward-thinking tone suitable for {settings.PROJECT_NAME}.
+    - Optionally include the website URL [{website_url}] if it fits naturally and adds value (e.g., for a thread starter).
 
-    Output ONLY the final post text.
+    Output ONLY the final post text, ready for publishing.
     """
     try:
+        # Use a fast model optimized for short, creative text
         post_text = await generate_with_openrouter(
             prompt=prompt,
-            model_preference="flash", # Fast model for short text
-            max_tokens=100 # X.com limit is 280 chars, keep AI output shorter
+            model_preference="flash",
+            max_tokens=120, # Keep it well under X.com limit
+            temperature=0.65
         )
-        # Basic length check
-        if len(post_text) > 280:
-            post_text = post_text[:275] + "..." # Truncate crudely if needed
-        logger.info(f"Crafted post text: {post_text}")
-        return post_text
+        # --- Output Validation ---
+        if not post_text or len(post_text) > 280: # Check length constraint
+            logger.warning(f"Generated post text failed validation (length: {len(post_text)}). Text: '{post_text}'")
+            # Attempt to truncate if slightly over, otherwise fail
+            if len(post_text) > 280 and len(post_text) < 300:
+                 post_text = post_text[:277] + "..."
+                 logger.info(f"Truncated post text: {post_text}")
+                 return post_text.strip()
+            else:
+                 return None # Fail if significantly over or empty
+
+        logger.info(f"Successfully crafted post text: {post_text}")
+        return post_text.strip()
+    except ConnectionError as conn_err:
+        logger.error(f"Connection error crafting branding post: {conn_err}", exc_info=False)
+        return None
     except Exception as e:
-        logger.error(f"Error crafting branding post text: {e}", exc_info=True)
+        logger.error(f"Unexpected error crafting branding post text: {e}", exc_info=True)
         return None
 
 
-async def post_to_x_com(post_text: str):
-    """Posts the generated text to the configured X.com account."""
-    # if not x_client_v2: # Check if client initialized
-    #     logger.warning("X.com client not available. Skipping post.")
-    #     return False
+async def post_to_x_com(post_text: str) -> bool:
+    """
+    Posts the generated text to the configured X.com account using Tweepy Client v2.
+    Includes basic error handling.
+    """
+    global X_API_ENABLED, x_client_v2
+    if not X_API_ENABLED or not x_client_v2:
+        logger.warning("X.com client not available or not enabled. Skipping post.")
+        print(f"--- SIMULATED X.COM POST (API Disabled) ---")
+        print(post_text)
+        print(f"-----------------------------------------")
+        await asyncio.sleep(0.1) # Minimal delay for simulation
+        return False # Indicate posting was skipped/simulated
 
-    logger.warning("X.com posting functionality is a placeholder. Requires valid X API v2 client setup.")
-    print(f"--- SIMULATED X.COM POST ---")
-    print(post_text)
-    print(f"---------------------------")
-    await asyncio.sleep(1) # Simulate API call delay
-    return True # Return True for simulation
-
-    # try:
-    #     response = x_client_v2.create_tweet(text=post_text)
-    #     logger.info(f"Successfully posted to X.com. Tweet ID: {response.data['id']}")
-    #     return True
-    # except Exception as e:
-    #     logger.error(f"Failed to post to X.com: {e}", exc_info=True)
-    #     # Consider sending Telegram alert on repeated failures
-    #     return False
+    logger.info(f"Attempting to post to X.com: '{post_text[:50]}...'")
+    try:
+        # Use Tweepy v2 client
+        # Run blocking API call in executor thread
+        response = await asyncio.to_thread(x_client_v2.create_tweet, text=post_text)
+        tweet_id = response.data['id']
+        logger.info(f"Successfully posted to X.com. Tweet ID: {tweet_id}")
+        return True
+    except Exception as e: # Catch potential TweepyHTTPException or others
+        logger.error(f"Failed to post to X.com: {e}", exc_info=True)
+        # Consider specific error handling for rate limits, duplicate content, etc.
+        # Example: if isinstance(e, tweepy.errors.Forbidden) and 'duplicate content' in str(e): logger.warning("Duplicate tweet detected.")
+        await send_telegram_alert(f"ERROR: Failed to post branding content to X.com! Error: {e}")
+        return False
 
 
 async def run_branding_cycle():
-    """Generates and posts branding content."""
+    """
+    Autonomous cycle for generating and posting branding content to X.com.
+    Triggered by the scheduler. Includes "Think Tool" checks.
+    """
     logger.info("--- Running Branding Cycle ---")
     try:
-        # 1. Generate Idea
+        # --- Pre-computation Check: API Enabled ---
+        if not X_API_ENABLED:
+            logger.info("Branding cycle skipped: X.com API not enabled.")
+            return
+
+        # 1. Generate Content Idea ("Think": Validates output)
         idea = await generate_branding_content_idea()
         if not idea:
-            logger.warning("Could not generate branding idea.")
+            logger.warning("Branding cycle failed: Could not generate valid content idea.")
             return
 
-        # 2. Craft Post
+        # 2. Craft Post Text ("Think": Validates output)
         post_text = await craft_branding_post(idea)
         if not post_text:
-            logger.warning("Could not craft branding post text.")
+            logger.warning("Branding cycle failed: Could not craft valid post text.")
             return
 
-        # 3. Post to X.com (Simulated)
+        # 3. Post to X.com ("Think": Handles API errors)
         await post_to_x_com(post_text)
+        # Success/failure logged within post_to_x_com
 
     except Exception as e:
-        logger.error(f"Error during branding cycle: {e}", exc_info=True)
+        logger.error(f"Unexpected error during branding cycle: {e}", exc_info=True)
+        # Send alert for unexpected cycle failure
+        await send_telegram_alert(f"ERROR: Unexpected failure in branding cycle: {e}")
 
     logger.info("--- Branding Cycle Finished ---")
